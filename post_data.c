@@ -50,6 +50,8 @@ do {\
 #define logger(level, fmt, args...)
 #endif
 
+#define MAX(a, b) ((a) > (b) ? (a) : (b))
+
 typedef struct task_queue_data_s {
     void *p;
     uint32_t size;
@@ -661,7 +663,7 @@ sender_thread (void *arg)
     return NULL;
 }
 
-#define SENDER_THREAD_CNT 8
+#define SENDER_THREAD_CNT 10
 
 static int
 create_sender_threads (sender_env_t *sender_env)
@@ -763,13 +765,297 @@ create_producer_thread (sender_env_t *sender_env)
     return 0;
 }
 
+enum {
+    COLUMN_ELAPSED = 0,
+    COLUMN_STATS,
+    COLUMN_PROGRESS,
+    COLUMN_QPS,
+    COLUMN_MAX
+};
+
+typedef struct column_s {
+    char *header;
+    char *value;
+    uint32_t max_width;
+    int i1;
+    int i2;
+    float f1;
+    char * (*maker)(struct column_s *);
+} column_t;
+
+typedef struct column_mgr_s {
+    column_t columns[COLUMN_MAX];
+    char *header;
+    char *seperator;
+    char *line;
+    uint32_t max_width;
+    uint32_t last_line_len;
+} column_mgr_t;
+
+column_mgr_t g_column_mgr;
+
+static char *
+column_elpased_maker (column_t *p)
+{
+    int seconds, hours, minutes;
+    char *s = NULL;
+
+    seconds = p->i1;
+    hours = seconds/3600;
+    seconds %= 3600;
+    minutes = seconds/60;
+    seconds %= 60;
+    if (!p->value) {
+        asprintf(&s, "%02d:%02d:%02d", hours, minutes, seconds);
+    } else {
+        snprintf(p->value, p->max_width+1,
+                 "%02d:%02d:%02d", hours, minutes, seconds);
+    }
+    return s;
+}
+
+static char *
+column_stats_maker (column_t *p)
+{
+    int success, total;
+    char *s = NULL;
+
+    success = p->i1;
+    total = p->i2;
+    if (!p->value) {
+        asprintf(&s, "%d/%d", success, total);
+    } else {
+        snprintf(p->value, p->max_width+1, "%d/%d", success, total);
+    }
+    return s;
+}
+
+static char *
+column_progress_maker (column_t *p)
+{
+    float progress;
+    char *s = NULL;
+
+    progress = p->f1;
+    if (!p->value) {
+        asprintf(&s, "%.1f%%", progress);
+    } else {
+        snprintf(p->value, p->max_width+1, "%.1f%%", progress);
+    }
+    return s;
+}
+
+static char *
+column_qps_maker (column_t *p)
+{
+    float qps;
+    char *s = NULL;
+
+    qps = p->f1;
+    if (!p->value) {
+        asprintf(&s, "%.1f", qps);
+    } else {
+        snprintf(p->value, p->max_width+1, "%.1f", qps);
+    }
+    return s;
+}
+
 static void
-dump_backspace (char *last_msg, char *cur_msg)
+fill_in_spaces (char *s, uint32_t cnt)
+{
+    uint32_t i;
+
+    for (i = 0; i < cnt; i++) {
+        s[i] = ' ';
+    }
+}
+
+static void
+column_mgr_make_header (column_mgr_t *column_mgr)
+{
+    column_t *column;
+    char *s;
+    int i, header_len;
+
+    column_mgr->header = calloc(column_mgr->max_width+1, sizeof(char));
+    if (!column_mgr->header) {
+        return;
+    }
+
+    s = column_mgr->header;
+    s[0] = ' ';
+    s++;
+    
+    for (i = 0; i < COLUMN_MAX; i++) {
+        column = &column_mgr->columns[i];
+        header_len = strlen(column->header);
+        strncpy(s, column->header, header_len);
+        s += header_len;
+        if (header_len < column->max_width) {
+            fill_in_spaces(s, column->max_width - header_len);
+            s += (column->max_width - header_len);
+        }
+        *s = ' ';
+        s++;
+    }
+}
+
+static void
+column_mgr_make_seperator (column_mgr_t *column_mgr)
+{
+    char *s;
+    int i;
+
+    column_mgr->seperator = calloc(column_mgr->max_width+1, sizeof(char));
+    if (!column_mgr->seperator) {
+        return;
+    }
+
+    s = column_mgr->seperator;
+    for (i = 0; i < column_mgr->max_width; i++) {
+        s[i] = '-';
+    }
+}
+
+static void
+column_mgr_make_line (column_mgr_t *column_mgr)
+{
+    column_t *column;
+    char *line = column_mgr->line;
+    int i, column_len;
+
+    column_mgr->last_line_len = strlen(line);
+
+    line[0] = ' ';
+    line++;
+    
+    for (i = 0; i < COLUMN_MAX; i++) {
+        column = &column_mgr->columns[i];
+        column->maker(column);
+        column_len = strlen(column->value);
+        strncpy(line, column->value, column_len);
+        line += column_len;
+        if (column_len < column->max_width) {
+            fill_in_spaces(line, column->max_width - column_len);
+            line += (column->max_width - column_len);
+        }
+        *line = ' ';
+        line++;
+    }
+}
+
+static int
+column_mgr_init_one_column (column_t *column)
+{
+    char *s;
+
+    s = column->maker(column);
+    if (!s) {
+        logger(ERROR, "Fail to init column header");
+        return -1;
+    }
+
+    column->max_width = MAX(strlen(column->header), strlen(s));
+    free(s);
+
+    column->value = calloc(column->max_width+1, sizeof(char));
+    if (!column->value) {
+        logger(ERROR, "Fail to calloc column value");
+        return -1;
+    }
+    return 0;
+}
+
+static int
+column_mgr_init_columns (column_mgr_t *column_mgr)
+{
+    column_t *p = column_mgr->columns;
+    int rc, i, max_width = 0;
+
+    for (i = 0; i < COLUMN_MAX; i++) {
+        rc = column_mgr_init_one_column(&p[i]);
+        if (rc != 0) {
+            return -1;
+        }
+        max_width += p[i].max_width;
+    }
+
+    max_width += COLUMN_MAX; //Each filed has a tailing space
+    max_width += 1; //one heading space
+    column_mgr->max_width = max_width;
+    return 0;
+}
+
+static int
+column_mgr_init (column_mgr_t *column_mgr, sender_env_t *sender_env)
+{
+    column_t *p = column_mgr->columns;
+    int rc;
+
+    memzero(column_mgr, sizeof(column_mgr_t));
+
+    p[COLUMN_ELAPSED].header = "Elapsed";
+    p[COLUMN_ELAPSED].i1 = 1;
+    p[COLUMN_ELAPSED].maker = column_elpased_maker;
+
+    p[COLUMN_STATS].header = "Success/Total";
+    p[COLUMN_STATS].i1 = sender_env->msg_cnt;
+    p[COLUMN_STATS].i2 = sender_env->msg_cnt;
+    p[COLUMN_STATS].maker = column_stats_maker;
+
+    p[COLUMN_PROGRESS].header = "Progress";
+    p[COLUMN_PROGRESS].f1 = 100.0;
+    p[COLUMN_PROGRESS].maker = column_progress_maker;
+
+    p[COLUMN_QPS].header = "QPS";
+    p[COLUMN_QPS].f1 = 1500.0;
+    p[COLUMN_QPS].maker = column_qps_maker;
+
+    rc = column_mgr_init_columns(column_mgr);
+    if (rc != 0) {
+        return rc;
+    }
+    column_mgr_make_header(column_mgr);
+    column_mgr_make_seperator(column_mgr);
+
+    column_mgr->line = calloc(column_mgr->max_width+1, sizeof(char));
+    if (!column_mgr->line) {
+        logger(ERROR, "Fail to calloc for column mgr line.");
+        return -1;
+    }
+    column_mgr->last_line_len = 0;
+    return 0;
+}
+
+static void
+column_mgr_clean (column_mgr_t *column_mgr)
+{
+    int i;
+
+    if (column_mgr->header) {
+        free(column_mgr->header);
+    }
+    if (column_mgr->seperator) {
+        free(column_mgr->seperator);
+    }
+    if (column_mgr->line) {
+        free(column_mgr->line);
+    }
+
+    for (i = 0; i < COLUMN_MAX; i++) {
+        if (column_mgr->columns[i].value) {
+            free(column_mgr->columns[i].value);
+        }
+    }
+}
+
+static void
+dump_backspace (column_mgr_t *column_mgr)
 {
     int last_len, cur_len, i, cnt;
 
-    last_len = strlen(last_msg);
-    cur_len = strlen(cur_msg);
+    last_len = column_mgr->last_line_len;
+    cur_len = strlen(column_mgr->line);
     if (last_len <= cur_len) {
         return;
     }
@@ -780,45 +1066,39 @@ dump_backspace (char *last_msg, char *cur_msg)
     }
 }
 
-static char *
+static void
 dump_stats (uint32_t total, uint32_t success, uint32_t msg_cnt,
-            struct timeval *start_ts, char *last_msg)
+            struct timeval *start_ts)
 {
+    column_t *p;
     struct timeval now;
-    int seconds, hours, minutes;
+    int seconds;
     float elapsed = 0, progress, qps;
-    char *msg;
 
     gettimeofday(&now, NULL);
     seconds = now.tv_sec - start_ts->tv_sec;
     elapsed += seconds;
     elapsed += (float)(now.tv_usec - start_ts->tv_usec)/1000/1000;
-
-    hours = seconds/3600;
-    seconds %= 3600;
-    minutes = seconds/60;
-    seconds %= 60;
-
     progress = (float)total/msg_cnt*100;
     qps = (float)total/elapsed;
-    asprintf(&msg, "%02d:%02d:%02d %d/%d %.1f%% QPS %.1f", hours, minutes, seconds,
-             success, total, progress, qps);
 
-    if (last_msg) {
-        dump_backspace(last_msg, msg);
-    }
+    p = g_column_mgr.columns;
+    p[COLUMN_ELAPSED].i1 = seconds;
+    p[COLUMN_STATS].i1 = success;
+    p[COLUMN_STATS].i2 = total;
+    p[COLUMN_PROGRESS].f1 = progress;
+    p[COLUMN_QPS].f1 = qps;
+
+    column_mgr_make_line(&g_column_mgr);
+    dump_backspace(&g_column_mgr);
 
 #ifdef _DEBUG_MODE_
-    logger(INFO, "%s", msg);
+    logger(INFO, "%s", g_column_mgr.line);
 #else
-    printf(msg);
-    fflush(stdin);
+    printf("\r%s", g_column_mgr.line);
+    fflush(stdout);
 #endif
-
-    if (last_msg) {
-        free(last_msg);
-    }
-    return msg;
+    return;
 }
 
 static void *
@@ -828,7 +1108,9 @@ counter_thread (void *arg)
     global_counter_t counter_snapshot;
     uint32_t msg_cnt = sender_env->msg_cnt;
     struct timeval start_ts;
-    char *last_msg = NULL;
+
+    printf("%s\n", g_column_mgr.header);
+    printf("%s\n", g_column_mgr.seperator);
 
     logger(INFO, "Wait for counter start.");
     gcounter_wait_for_start(&gcounter);
@@ -837,20 +1119,22 @@ counter_thread (void *arg)
     for (;;) {
         usleep(500*1000); //500ms
         gcounter_get_snapshot(&gcounter, &counter_snapshot);
-        last_msg = dump_stats(counter_snapshot.total, counter_snapshot.success,
-                              msg_cnt, &start_ts, last_msg);
+        dump_stats(counter_snapshot.total, counter_snapshot.success,
+                   msg_cnt, &start_ts);
                    
+        if (counter_snapshot.total == msg_cnt) {
+            break;
+        }
     }
     return NULL;
 }
 
 static int
-create_counter_thread (sender_env_t *sender_env)
+create_counter_thread (sender_env_t *sender_env, pthread_t *thread_id)
 {
-    pthread_t thread_id;
     int rc;
 
-    rc = pthread_create(&thread_id, NULL, counter_thread, sender_env);
+    rc = pthread_create(thread_id, NULL, counter_thread, sender_env);
     if (rc != 0) {
         logger(ERROR, "Fail to create counter thread");
         return -1;
@@ -881,6 +1165,12 @@ prepare_env (sender_env_t *sender_env)
         return -1;
     }
 
+    rc = column_mgr_init(&g_column_mgr, sender_env);
+    if (rc != 0) {
+        column_mgr_clean(&g_column_mgr);
+        return -1;
+    }
+
     sender_env->ip = "127.0.0.1";
     sender_env->port = 9000;
     sender_env->msg_cnt = 50000;
@@ -893,6 +1183,7 @@ clean_env (sender_env_t *sender_env)
     close(sender_env->epfd);
     task_queue_clean(&task_queue);
     gcounter_clean(&gcounter);
+    column_mgr_clean(&g_column_mgr);
 }
 
 static void
@@ -940,6 +1231,7 @@ int main (void)
     int rc, ready;
     sender_env_t sender_env;
     struct epoll_event evlist[EPOLL_WAIT_MAX_EVENTS];
+    pthread_t counter_thread_id;
 
     rc = prepare_env(&sender_env);
     if (rc != 0) {
@@ -956,7 +1248,7 @@ int main (void)
         return -1;
     }
 
-    rc = create_counter_thread(&sender_env);
+    rc = create_counter_thread(&sender_env, &counter_thread_id);
     if (rc != 0) {
         return -1;
     }
@@ -978,8 +1270,10 @@ int main (void)
         }
     }
 
+    pthread_join(counter_thread_id, NULL);
+
     clean_env(&sender_env);
-    logger(INFO, "done.");
+    printf("\nPost done.\n");
     return 0;
 }
 
