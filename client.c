@@ -19,262 +19,24 @@
 #include <sys/time.h>
 #include <sys/epoll.h>
 #include <sys/socket.h>
-#include <sys/syscall.h>  
 #include <netinet/in.h>
 #include <netinet/tcp.h>
+#include "util.h"
+#include "task_queue.h"
+#include "server_common.h"
 
-#ifndef True
-#define True true
-#endif
+#define RESP_MAX_BUF_LEN 1023
+#define SENDER_WAIT_RESP_TIMEOUT 30 //seconds
 
-#ifndef False
-#define False false
-#endif
+#define EPOLL_WAIT_MAX_EVENTS SENDER_THREAD_CNT
+#define EPOLL_WAIT_TIMEOUT 500 //ms
 
-#ifdef _DEBUG_MODE_
-#define LOGGER_TIME_TS_MAX_LEN 63
-#define gettid() syscall(__NR_gettid)
-#define logger(level, fmt, args...) \
-do {\
-    struct timeval __cur_tv; \
-    struct tm __cur_tm; \
-    char __ts[LOGGER_TIME_TS_MAX_LEN+1]; \
-    gettimeofday(&__cur_tv, NULL); \
-    localtime_r(&__cur_tv.tv_sec, &__cur_tm); \
-    strftime(__ts, LOGGER_TIME_TS_MAX_LEN, "%T", &__cur_tm); \
-    printf("%s.%03d <%04x> "#level" "fmt"\n", __ts, (int)__cur_tv.tv_usec/1000,\
-           (unsigned int)gettid(), ##args); \
-    fflush(stdin); \
-} while (0)
-#else
-#define logger(level, fmt, args...)
-#endif
+#define SEND_MSG_MAX_TRY 3
+#define SENDER_THREAD_CNT 10
+#define SEND_MSG_CNT 50000
 
-#define MAX(a, b) ((a) > (b) ? (a) : (b))
-
-typedef struct task_queue_data_s {
-    void *p;
-    uint32_t size;
-} task_queue_data_t;
-
-typedef struct task_queue_entry_s {
-    struct task_queue_entry_s *prev;
-    struct task_queue_entry_s *next;
-    task_queue_data_t data;
-    bool from_pool;
-    bool free;
-} task_queue_entry_t;
-
-#define TASK_QUEUE_ENTRY_POOL_SIZE 50
-#define TASK_QUEUE_MAX_SIZE TASK_QUEUE_ENTRY_POOL_SIZE
-
-typedef struct task_queue_s {
-    task_queue_entry_t entry_pool[TASK_QUEUE_ENTRY_POOL_SIZE];
-    task_queue_entry_t *head;
-    uint32_t queue_size;
-    pthread_mutex_t lock;
-    pthread_cond_t cond_sender;
-    pthread_cond_t cond_producer;
-} task_queue_t;
-
-task_queue_t task_queue;
-
-static void
-memzero (void *p, uint32_t size)
-{
-    memset(p, 0, size);
-    return;
-}
-
-static int
-task_queue_init (task_queue_t *queue)
-{
-    int rc, i;
-
-    memzero(queue, sizeof(task_queue_t));
-
-    rc = pthread_mutex_init(&queue->lock, NULL);
-    if (rc != 0) {
-        logger(ERROR, "Fail to init mutex.");
-        return rc;
-    }
-
-    rc = pthread_cond_init(&queue->cond_sender, NULL);
-    if (rc != 0) {
-        logger(ERROR, "Fail to init cond sender.");
-        return rc;
-    }
-
-    rc = pthread_cond_init(&queue->cond_producer, NULL);
-    if (rc != 0) {
-        logger(ERROR, "Fail to init cond producer.");
-        return rc;
-    }
-
-    for (i = 0; i < TASK_QUEUE_ENTRY_POOL_SIZE; i++) {
-        queue->entry_pool[i].from_pool = True;
-        queue->entry_pool[i].free = True;
-    }
-
-    return 0;
-}
-
-static void
-task_queue_clean (task_queue_t *queue)
-{
-    pthread_mutex_destroy(&queue->lock);
-    pthread_cond_destroy(&queue->cond_sender);
-    pthread_cond_destroy(&queue->cond_producer);
-}
-
-static void
-task_queue_lock (task_queue_t *queue)
-{
-    pthread_mutex_lock(&queue->lock);
-}
-
-static void
-task_queue_unlock (task_queue_t *queue)
-{
-    pthread_mutex_unlock(&queue->lock);
-}
-
-static bool
-task_queue_is_empty (task_queue_t *queue)
-{
-    if (queue->queue_size > 0) {
-        return False;
-    } else {
-        return True;
-    }
-}
-
-static bool
-task_queue_is_full (task_queue_t *queue)
-{
-    if (queue->queue_size < TASK_QUEUE_MAX_SIZE) {
-        return False;
-    } else {
-        return True;
-    }
-}
-
-static task_queue_entry_t *
-task_queue_get_entry_from_pool (task_queue_t *queue)
-{
-    uint32_t i;
-
-    for (i = 0; i < TASK_QUEUE_ENTRY_POOL_SIZE; i++) {
-        if (queue->entry_pool[i].free) {
-            queue->entry_pool[i].free = False;
-            return &queue->entry_pool[i];
-        }
-    }
-    return NULL;
-}
-
-static task_queue_entry_t *
-task_queue_get_entry (task_queue_t *queue)
-{
-    task_queue_entry_t *entry;
-
-    entry = task_queue_get_entry_from_pool(queue);
-    if (entry) {
-        return entry;
-    }
-
-    entry = calloc(1, sizeof(task_queue_entry_t));
-    if (!entry) {
-        return NULL;
-    }
-    entry->from_pool = False;
-    return entry;
-}
-
-static void
-task_queue_free_entry (task_queue_entry_t *entry)
-{
-    if (entry->from_pool) {
-        entry->free = True;
-    } else {
-        free(entry);
-    }
-}
-
-static void
-task_queue_enqueue (task_queue_t *queue, task_queue_data_t *data)
-{
-    task_queue_entry_t *entry;
-
-    entry = task_queue_get_entry(queue);
-    if (!entry) {
-        logger(ERROR, "Task queue: fail to get entry.");
-        return;
-    }
-    memcpy(&entry->data, data, sizeof(task_queue_data_t));
-
-    if (queue->head) {
-        entry->next = queue->head;
-        entry->prev = queue->head->prev;
-        entry->next->prev = entry;
-        entry->prev->next = entry;
-    } else {
-        entry->next = entry;
-        entry->prev = entry;
-    }
-    queue->head = entry;
-    queue->queue_size += 1;
-}
-
-static void
-task_queue_dequeue (task_queue_t *queue, task_queue_data_t *data)
-{
-    task_queue_entry_t *entry;
-
-    if (queue->queue_size == 1) {
-        entry = queue->head;
-        queue->head = NULL;
-    } else {
-        entry = queue->head->prev;
-        entry->prev->next = entry->next;
-        entry->next->prev = entry->prev;
-    }
-    queue->queue_size -= 1;
-    memcpy(data, &entry->data, sizeof(task_queue_data_t));
-    task_queue_free_entry(entry);
-}
-
-static void
-task_queue_get (task_queue_t *queue, task_queue_data_t *data)
-{
-    task_queue_lock(queue);
-    for (;;) {
-        if (!task_queue_is_empty(queue)) {
-            break;
-        }
-        pthread_cond_wait(&queue->cond_sender, &queue->lock);
-    }
-
-    task_queue_dequeue(queue, data);
-    task_queue_unlock(queue);
-    pthread_cond_broadcast(&queue->cond_producer);
-}
-
-static void
-task_queue_put (task_queue_t *queue, task_queue_data_t *data)
-{
-    task_queue_lock(queue);
-    for (;;) {
-        if (!task_queue_is_full(queue)) {
-            break;
-        }
-        pthread_cond_wait(&queue->cond_producer, &queue->lock);
-    }
-
-    task_queue_enqueue(queue, data);
-    task_queue_unlock(queue);
-    pthread_cond_broadcast(&queue->cond_sender);
-}
+#define DEST_IP "127.0.0.1"
+#define DEST_PORT SERVER_PORT
 
 typedef struct global_counter_s {
     pthread_mutex_t lock;
@@ -285,7 +47,57 @@ typedef struct global_counter_s {
     uint32_t failure;
 } global_counter_t;
 
+typedef struct sender_env_s {
+    int epfd;
+    char *ip;
+    int port;
+    uint32_t msg_cnt;
+    uint32_t sender_cnt;
+} sender_env_t;
+
+typedef struct sender_ctrl_s {
+    int epfd;
+    char *ip;
+    int port;
+    int sockfd;
+    struct sockaddr_in sockaddr;
+    bool resp_ready;
+    pthread_mutex_t lock;
+    pthread_cond_t cond;
+} sender_ctrl_t;
+
+enum {
+    COLUMN_ELAPSED = 0,
+    COLUMN_STATS,
+    COLUMN_PROGRESS,
+    COLUMN_QPS,
+    COLUMN_MAX
+};
+
+typedef struct column_s {
+    char *header;
+    char *value;
+    uint32_t max_width;
+    int i1;
+    int i2;
+    float f1;
+    char * (*maker)(struct column_s *);
+} column_t;
+
+typedef struct column_mgr_s {
+    column_t columns[COLUMN_MAX];
+    char *header;
+    char *seperator;
+    char *line;
+    uint32_t max_width;
+    uint32_t last_line_len;
+} column_mgr_t;
+
 static global_counter_t gcounter;
+
+static task_queue_t task_queue;
+
+static column_mgr_t g_column_mgr;
 
 static int
 gcounter_init (global_counter_t *p)
@@ -383,27 +195,6 @@ gcounter_get_total (global_counter_t *p)
     gcounter_unlock(p);
     return total;
 }
-
-typedef struct sender_env_s {
-    int epfd;
-    char *ip;
-    int port;
-    uint32_t msg_cnt;
-} sender_env_t;
-
-typedef struct sender_ctrl_s {
-    int epfd;
-    char *ip;
-    int port;
-    int sockfd;
-    struct sockaddr_in sockaddr;
-    bool resp_ready;
-    pthread_mutex_t lock;
-    pthread_cond_t cond;
-} sender_ctrl_t;
-
-#define RESP_MAX_BUF_LEN 1023
-#define SENDER_WAIT_RESP_TIMEOUT 30 //seconds
 
 static int
 sender_socket_open (sender_ctrl_t *sender_ctrl)
@@ -516,13 +307,13 @@ wait_for_resp (sender_ctrl_t *sender_ctrl)
     rc = epoll_ctl(sender_ctrl->epfd, EPOLL_CTL_ADD,
                    sender_ctrl->sockfd, &ev);
     if (rc != 0) {
-        logger(ERROR, "Fail to epoll_ctl.");
+        logger(ERROR, "Fail on epoll_ctl.");
         return -1;
     }
 
     rc = sender_wait(sender_ctrl);
     epoll_ctl(sender_ctrl->epfd, EPOLL_CTL_DEL,
-              sender_ctrl->sockfd, &ev);
+              sender_ctrl->sockfd, NULL);
     if (rc != 0) {
         return -1;
     }
@@ -563,8 +354,6 @@ send_http_msg_once (sender_ctrl_t *sender_ctrl, char *msg)
 
     return 0;
 }
-
-#define SEND_MSG_MAX_TRY 3
 
 static void
 send_http_msg (sender_ctrl_t *sender_ctrl, char *msg)
@@ -617,7 +406,7 @@ sender_init (sender_env_t *sender_env)
 
     bzero((char *)&sender_ctrl->sockaddr, sizeof(struct sockaddr_in));
     sender_ctrl->sockaddr.sin_family = AF_INET;
-    sender_ctrl->sockaddr.sin_addr.s_addr = inet_addr(sender_ctrl->ip);
+    inet_pton(AF_INET, sender_ctrl->ip, &sender_ctrl->sockaddr.sin_addr);
     sender_ctrl->sockaddr.sin_port = htons(sender_ctrl->port);
     return sender_ctrl;
 }
@@ -651,6 +440,7 @@ sender_thread (void *arg)
         return NULL;
     }
 
+    logger(DEBUG, "Start to work on msg queue...");
     for (;;) {
         task_queue_get(&task_queue, &data);
         msg = (char *)data.p;
@@ -663,8 +453,6 @@ sender_thread (void *arg)
     return NULL;
 }
 
-#define SENDER_THREAD_CNT 10
-
 static int
 create_sender_threads (sender_env_t *sender_env)
 {
@@ -672,7 +460,7 @@ create_sender_threads (sender_env_t *sender_env)
     uint32_t i;
     pthread_t thread_id;
 
-    for (i = 0; i < SENDER_THREAD_CNT; i++) {
+    for (i = 0; i < sender_env->sender_cnt; i++) {
         rc = pthread_create(&thread_id, NULL, sender_thread, sender_env);
         if (rc != 0) {
             logger(ERROR, "Fail to create sender thread");
@@ -690,8 +478,7 @@ msg_header_template = "POST /graph/ HTTP/1.1\r\n"
                       "\r\n"; 
 
 static char *
-msg_body_template = "{\"vertices\": {\"Txn\": {\"tran_id%d_%d\": "
-                    "{\"clt_nbr\": {\"value\":\"2645\"}}}}}"; 
+msg_body_template = "{\"txn_id\": \"txn_%d_%d\"}";
 
 static char *
 generate_msg (char *ip, int port, uint32_t i)
@@ -724,7 +511,7 @@ generate_msg (char *ip, int port, uint32_t i)
     free(msg_body);
     free(msg_header);
 
-    //logger(DEBUG, "Produce msg as:\n%s", msg);
+    logger(DEBUG, "Produce msg as:\n%s", msg);
     return msg;
 }
 
@@ -744,7 +531,6 @@ producer_thread (void *arg)
             continue;
         }
         data.p = msg;
-        data.size = strlen(msg) + 1;
         task_queue_put(&task_queue, &data);
     }
 
@@ -764,35 +550,6 @@ create_producer_thread (sender_env_t *sender_env)
     }
     return 0;
 }
-
-enum {
-    COLUMN_ELAPSED = 0,
-    COLUMN_STATS,
-    COLUMN_PROGRESS,
-    COLUMN_QPS,
-    COLUMN_MAX
-};
-
-typedef struct column_s {
-    char *header;
-    char *value;
-    uint32_t max_width;
-    int i1;
-    int i2;
-    float f1;
-    char * (*maker)(struct column_s *);
-} column_t;
-
-typedef struct column_mgr_s {
-    column_t columns[COLUMN_MAX];
-    char *header;
-    char *seperator;
-    char *line;
-    uint32_t max_width;
-    uint32_t last_line_len;
-} column_mgr_t;
-
-column_mgr_t g_column_mgr;
 
 static char *
 column_elpased_maker (column_t *p)
@@ -1008,7 +765,7 @@ column_mgr_init (column_mgr_t *column_mgr, sender_env_t *sender_env)
     p[COLUMN_PROGRESS].maker = column_progress_maker;
 
     p[COLUMN_QPS].header = "QPS";
-    p[COLUMN_QPS].f1 = 1500.0;
+    p[COLUMN_QPS].f1 = 10000.0;
     p[COLUMN_QPS].maker = column_qps_maker;
 
     rc = column_mgr_init_columns(column_mgr);
@@ -1171,9 +928,67 @@ prepare_env (sender_env_t *sender_env)
         return -1;
     }
 
-    sender_env->ip = "127.0.0.1";
-    sender_env->port = 9000;
-    sender_env->msg_cnt = 50000;
+    sender_env->ip = DEST_IP;
+    sender_env->port = DEST_PORT;
+    return 0;
+}
+
+static void
+usage (void)
+{
+    printf("post_data [msg_count] -j <thread_count>\n");
+}
+
+static bool
+is_digit_string (char *s)
+{
+    for (; *s; s++) {
+        if (*s < '0' || *s > '9') {
+            return False;
+        }
+    }
+    return True;
+}
+
+// seems like optarg doesn't support single argument, write a simple one
+static int
+parse_args (int argc, char **argv, sender_env_t *sender_env)
+{
+    sender_env->msg_cnt = SEND_MSG_CNT;
+    sender_env->sender_cnt = SENDER_THREAD_CNT;
+
+    if (argc == 1) {
+        return 0;
+    }
+
+    if (strcmp(argv[1], "--help") == 0) {
+        return -1;
+    } else if (!is_digit_string(argv[1])) {
+        printf("msg count should be a integer.\n");
+        return -1;
+    } else {
+        sender_env->msg_cnt = atoi(argv[1]);
+    }
+
+    if (argc == 2) {
+        return 0;
+    } else if (argc < 4) {
+        printf("Should follow option with job count.\n");
+        return -1;
+    }
+
+    if (strcmp(argv[2], "-j") != 0) {
+        printf("Unsupported option %s.\n", argv[2]);
+        return -1;
+    }
+
+    if (!is_digit_string(argv[3])) {
+        printf("job count should be a integer.\n");
+        return -1;
+    } else {
+        sender_env->sender_cnt = atoi(argv[3]);
+    }
+
     return 0;
 }
 
@@ -1223,18 +1038,68 @@ is_task_done (sender_env_t *sender_env)
     }
 }
 
-#define EPOLL_WAIT_MAX_EVENTS SENDER_THREAD_CNT
-#define EPOLL_WAIT_TIMEOUT 500 //ms
+static int
+test_connection (void)
+{
+    int sockfd, rc, one, port;
+    struct sockaddr_in sockaddr;
+    char *err, *ip;
 
-int main (void)
+    ip = DEST_IP;
+    port = DEST_PORT;
+
+    sockfd = socket(AF_INET, SOCK_STREAM, 0);
+    if (sockfd < 0) {
+        logger(ERROR, "Fail to open socket.");
+        return -1;
+    }
+
+    one = 1;
+    rc = setsockopt(sockfd, IPPROTO_TCP, TCP_NODELAY,
+                    &one, sizeof(one));
+    if (rc != 0) {
+        logger(ERROR, "Fail to set sockopt");
+        return -1;
+    }
+
+    bzero((char *)&sockaddr, sizeof(struct sockaddr_in));
+    sockaddr.sin_family = AF_INET;
+    inet_pton(AF_INET, ip, &sockaddr.sin_addr);
+    sockaddr.sin_port = htons(port);
+
+    rc = connect(sockfd,
+                (struct sockaddr *)&sockaddr,
+                sizeof(struct sockaddr_in));
+    if (rc != 0) {
+        err = strerror(errno);
+        printf("Fail to connect to %s:%d, %s\n", ip, port, err);
+        return -1;
+    }
+
+    close(sockfd);
+    return 0;
+}
+
+int main (int argc, char **argv)
 {
     int rc, ready;
     sender_env_t sender_env;
     struct epoll_event evlist[EPOLL_WAIT_MAX_EVENTS];
     pthread_t counter_thread_id;
 
+    rc = test_connection();
+    if (rc != 0) {
+        return -1;
+    }
+
     rc = prepare_env(&sender_env);
     if (rc != 0) {
+        return -1;
+    }
+
+    rc = parse_args(argc, argv, &sender_env);
+    if (rc != 0) {
+        usage();
         return -1;
     }
 
